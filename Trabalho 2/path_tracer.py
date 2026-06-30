@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -432,25 +433,69 @@ class Camera:
         return Ray(self.position, direction)
 
 
-def render(scene_builder, filename, width, height, spp, max_depth, seed, use_mis):
+def tone_map(image, exposure=1.35):
+    exposed = np.clip(image, 0.0, None) * exposure
+    return 1.0 - np.exp(-exposed)
+
+
+_WORKER_SCENE = None
+_WORKER_CAMERA = None
+
+
+def _init_render_worker(scene, camera):
+    global _WORKER_SCENE, _WORKER_CAMERA
+    _WORKER_SCENE = scene
+    _WORKER_CAMERA = camera
+
+
+def _render_row(task):
+    y, width, height, spp, max_depth, seed, use_mis = task
     rng = np.random.default_rng(seed)
+    row = np.zeros((width, 3), dtype=float)
+    for x in range(width):
+        color = np.zeros(3)
+        for _ in range(spp):
+            u = (x + rng.random()) / width
+            v = (y + rng.random()) / height
+            color += trace_path(_WORKER_CAMERA.generate_ray(u, v), _WORKER_SCENE, rng, max_depth, use_mis)
+        row[x] = color / spp
+    return y, row
+
+
+def render(scene_builder, filename, width, height, spp, max_depth, seed, use_mis, exposure=1.35, workers=None):
     scene, camera = scene_builder(width / height)
     image = np.zeros((height, width, 3), dtype=float)
     start = time.time()
-    print(f"Rendering {filename}: {width}x{height}, spp={spp}, depth={max_depth}, mis={use_mis}")
+    worker_count = workers if workers is not None else max(1, os.cpu_count() or 1)
+    print(
+        f"Rendering {filename}: {width}x{height}, spp={spp}, depth={max_depth}, "
+        f"mis={use_mis}, workers={worker_count}"
+    )
 
-    for y in range(height):
-        if y % max(1, height // 10) == 0:
-            print(f"  line {y}/{height}")
-        for x in range(width):
-            color = np.zeros(3)
-            for _ in range(spp):
-                u = (x + rng.random()) / width
-                v = (y + rng.random()) / height
-                color += trace_path(camera.generate_ray(u, v), scene, rng, max_depth, use_mis)
-            image[y, x] = color / spp
+    if worker_count <= 1:
+        rng = np.random.default_rng(seed)
+        for y in range(height):
+            if y % max(1, height // 10) == 0:
+                print(f"  line {y}/{height}")
+            for x in range(width):
+                color = np.zeros(3)
+                for _ in range(spp):
+                    u = (x + rng.random()) / width
+                    v = (y + rng.random()) / height
+                    color += trace_path(camera.generate_ray(u, v), scene, rng, max_depth, use_mis)
+                image[y, x] = color / spp
+    else:
+        tasks = [
+            (y, width, height, spp, max_depth, seed + y * 1000003, use_mis)
+            for y in range(height)
+        ]
+        with ProcessPoolExecutor(max_workers=worker_count, initializer=_init_render_worker, initargs=(scene, camera)) as pool:
+            for index, (y, row) in enumerate(pool.map(_render_row, tasks, chunksize=1), start=1):
+                image[y] = row
+                if index % max(1, height // 10) == 0 or index == height:
+                    print(f"  line {y}/{height}")
 
-    mapped = np.power(np.clip(image, 0.0, None) / (1.0 + np.clip(image, 0.0, None)), 1.0 / 2.2)
+    mapped = np.power(tone_map(image, exposure), 1.0 / 2.2)
     os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
     Image.fromarray(np.clip(mapped * 255.0, 0, 255).astype(np.uint8)).save(filename)
     print(f"Saved {filename} in {time.time() - start:.2f}s")
@@ -481,10 +526,10 @@ def add_cornell_box(scene, open_top=False, open_back=False):
 def base_scene(aspect):
     scene = Scene()
     mat = add_cornell_box(scene)
-    scene.add(Sphere((-1.05, 1.0, -1.4), 1.0, mat["blue"]))
-    scene.add(Box((0.55, 0.0, -2.7), (1.8, 2.2, -1.45), mat["yellow"]))
-    scene.add_light(RectAreaLight((0.0, 5.85, -1.3), (1.7, 0.0, 0.0), (0.0, 0.0, 1.7), (12.0, 12.0, 11.0)))
-    camera = Camera((0, 3.0, 7.8), (0, 2.7, -1.5), aspect=aspect, fov=42.0)
+    scene.add(Sphere((-1.1, 1.05, -1.15), 1.05, mat["blue"]))
+    scene.add(Box((0.55, 0.0, -2.75), (1.85, 1.95, -1.4), mat["yellow"]))
+    scene.add_light(RectAreaLight((0.0, 5.9, -1.25), (2.1, 0.0, 0.0), (0.0, 0.0, 2.1), (18.0, 18.0, 17.0)))
+    camera = Camera((0, 3.05, 8.3), (0, 2.45, -1.45), aspect=aspect, fov=38.0)
     return scene, camera
 
 
@@ -542,28 +587,29 @@ SCENES = {
 
 def render_suite(args):
     out_dir = args.output_dir
-    render(base_scene, os.path.join(out_dir, "base_cornell.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed, args.mis)
+    render(base_scene, os.path.join(out_dir, "base_cornell.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed, args.mis, workers=args.workers)
     for spp in (16, 64, 256):
-        render(base_scene, os.path.join(out_dir, f"spp_{spp}.png"), args.width, args.height, max(1, min(spp, args.max_suite_spp)), max(args.depth, 4), args.seed + spp, args.mis)
+        render(base_scene, os.path.join(out_dir, f"spp_{spp}.png"), args.width, args.height, max(1, min(spp, args.max_suite_spp)), max(args.depth, 4), args.seed + spp, args.mis, workers=args.workers)
     for depth in (2, 4, 6):
-        render(base_scene, os.path.join(out_dir, f"depth_{depth}.png"), args.width, args.height, args.spp, depth, args.seed + depth, args.mis)
-    render(environment_scene, os.path.join(out_dir, "environment_light.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed + 301, args.mis)
-    render(mesh_light_scene, os.path.join(out_dir, "mesh_light.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed + 401, args.mis)
-    render(mis_scene, os.path.join(out_dir, "mis_off.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed + 501, False)
-    render(mis_scene, os.path.join(out_dir, "mis_on.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed + 501, True)
+        render(base_scene, os.path.join(out_dir, f"depth_{depth}.png"), args.width, args.height, args.spp, depth, args.seed + depth, args.mis, workers=args.workers)
+    render(environment_scene, os.path.join(out_dir, "environment_light.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed + 301, args.mis, workers=args.workers)
+    render(mesh_light_scene, os.path.join(out_dir, "mesh_light.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed + 401, args.mis, workers=args.workers)
+    render(mis_scene, os.path.join(out_dir, "mis_off.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed + 501, False, workers=args.workers)
+    render(mis_scene, os.path.join(out_dir, "mis_on.png"), args.width, args.height, args.spp, max(args.depth, 4), args.seed + 501, True, workers=args.workers)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Path tracer Monte Carlo para o Projeto 2 de INF2608.")
     parser.add_argument("--scene", choices=sorted(SCENES.keys()) + ["all"], default="base_cornell")
-    parser.add_argument("--width", type=int, default=160)
-    parser.add_argument("--height", type=int, default=160)
-    parser.add_argument("--spp", type=int, default=16)
+    parser.add_argument("--width", type=int, default=1080)
+    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--spp", type=int, default=256)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--output", default="Trabalho 2/base_cornell.png")
     parser.add_argument("--output-dir", default="Trabalho 2/img")
     parser.add_argument("--mis", action="store_true")
+    parser.add_argument("--workers", type=int, default=max(1, os.cpu_count() or 1), help="Número de processos para paralelizar por linhas.")
     parser.add_argument("--max-suite-spp", type=int, default=32, help="Limita custo da suite mantendo os nomes comparativos.")
     return parser.parse_args()
 
@@ -573,7 +619,7 @@ def main():
     if args.scene == "all":
         render_suite(args)
         return
-    render(SCENES[args.scene], args.output, args.width, args.height, args.spp, args.depth, args.seed, args.mis)
+    render(SCENES[args.scene], args.output, args.width, args.height, args.spp, args.depth, args.seed, args.mis, workers=args.workers)
 
 
 if __name__ == "__main__":
